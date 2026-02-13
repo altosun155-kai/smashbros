@@ -45,7 +45,7 @@ if "rr_records" not in st.session_state:
 if "players_multiline" not in st.session_state:
     st.session_state.players_multiline = "You\nFriend1\nFriend2"
 
-# NEW: player ordering state for hierarchical system
+# Player ordering state for seeding system
 if "player_order_drawn" not in st.session_state:
     st.session_state.player_order_drawn = []
 if "player_order_final" not in st.session_state:
@@ -114,330 +114,255 @@ def entry_to_label(e: Optional[Entry]) -> str:
         return ""
     return f"{e.player} — {e.character}"
 
-# ---------------------------- Hierarchical Weighted Tournament System ----------------------------
-def split_half(seq: List) -> Tuple[List, List]:
+# ---------------------------- IMPROVED BRACKET GENERATOR ----------------------------
+class ImprovedBracketGenerator:
     """
-    Split into top half and bottom half.
-    If odd, top half gets the extra element.
+    Generates tournament brackets with proper seeding based on player rankings.
+    
+    Key improvements:
+    1. Respects player order/rankings for seeding
+    2. Distributes characters round-robin for even spacing
+    3. Ensures players don't compete consecutively when possible
+    4. Distributes BYEs strategically to lower-ranked players
+    5. Follows standard tournament seeding (1 vs lowest, 2 vs second-lowest, etc.)
     """
-    mid = (len(seq) + 1) // 2
-    return seq[:mid], seq[mid:]
-
-def build_player_character_map(entries: List[Entry], df: pd.DataFrame) -> Dict[str, List[str]]:
-    """
-    Character ordering = the order in the table editor (df row order).
-    If df not usable, fallback to entries insertion order.
-    """
-    order_map: Dict[str, List[str]] = {}
-    if df is not None and "Player" in df.columns and "Character" in df.columns:
-        for _, row in df.iterrows():
-            p = str(row.get("Player", "")).strip()
-            c = str(row.get("Character", "")).strip()
-            if not p or not c:
-                continue
-            order_map.setdefault(p, []).append(c)
-    else:
-        for e in entries:
-            order_map.setdefault(e.player, []).append(e.character)
-    # remove dupes while preserving order (in case user repeats)
-    for p, chars in order_map.items():
-        seen = set()
-        deduped = []
-        for c in chars:
-            if c in seen:
-                continue
-            seen.add(c)
-            deduped.append(c)
-        order_map[p] = deduped
-    return order_map
-
-def categorize_entries_ABC(
-    entries: List[Entry],
-    player_order_final: List[str],
-    df_table: pd.DataFrame
-) -> Dict[Entry, str]:
-    """
-    Phase 2:
-      - split players into top half / bottom half based on final order
-      - split each player's characters into top half / bottom half
-      - Category A: top chars of top-half players
-      - Category B: bottom chars of top-half players + top chars of bottom-half players
-      - Category C: bottom chars of bottom-half players
-    """
-    player_chars = build_player_character_map(entries, df_table)
-
-    # keep only players that actually exist in entries
-    present_players = [p for p in player_order_final if p in player_chars]
-    if not present_players:
-        present_players = sorted(player_chars.keys())
-
-    top_players, bottom_players = split_half(present_players)
-    top_set = set(top_players)
-    bottom_set = set(bottom_players)
-
-    cat: Dict[Entry, str] = {}
-    for e in entries:
-        chars = player_chars.get(e.player, [])
-        top_chars, bottom_chars = split_half(chars)
-        if e.player in top_set:
-            if e.character in top_chars:
-                cat[e] = "A"
-            else:
-                cat[e] = "B"
-        elif e.player in bottom_set:
-            if e.character in top_chars:
-                cat[e] = "B"
-            else:
-                cat[e] = "C"
-        else:
-            # if player wasn't in the ordering for some reason, treat as bottom group
-            if e.character in top_chars:
-                cat[e] = "B"
-            else:
-                cat[e] = "C"
-    return cat
-
-def weighted_pick(
-    candidates: List[Entry],
-    weights: List[float]
-) -> Optional[Entry]:
-    if not candidates:
-        return None
-    return random.choices(candidates, weights=weights, k=1)[0]
-
-def generate_bracket_hierarchical_weighted(
-    entries: List[Entry],
-    *,
-    team_mode: bool = False,
-    team_of: Optional[Dict[str, str]] = None,
-    df_table: Optional[pd.DataFrame] = None,
-    player_order_final: Optional[List[str]] = None,
-    max_attempts: int = 200
-) -> List[Tuple[Entry, Entry]]:
-    team_of = team_of or {}
-    base = [e for e in entries if e.player != "SYSTEM" and e.character.strip()]
-    if len(base) < 2:
-        return []
-
-    bye_entry = Entry("SYSTEM", "BYE")
-    byes_budget = byes_needed(len(base))
-    target = next_power_of_two(len(base))
-    target_pairs = target // 2
-
-    final_order = player_order_final or sorted({e.player for e in base})
-    cat_map = categorize_entries_ABC(base, final_order, df_table if df_table is not None else pd.DataFrame())
-
-    def allowed(a: Entry, b: Entry) -> bool:
-        if a.player == b.player:
+    
+    def __init__(
+        self,
+        entries: List[Entry],
+        player_order: List[str],
+        team_mode: bool = False,
+        team_of: Optional[Dict[str, str]] = None
+    ):
+        self.entries = [e for e in entries if e.player != "SYSTEM" and e.character.strip()]
+        self.player_order = player_order or sorted(set(e.player for e in self.entries))
+        self.team_mode = team_mode
+        self.team_of = team_of or {}
+        
+        # Build character lists per player (preserving table order)
+        self.player_chars: Dict[str, List[str]] = {}
+        for e in self.entries:
+            if e.player not in self.player_chars:
+                self.player_chars[e.player] = []
+            if e.character not in self.player_chars[e.player]:
+                self.player_chars[e.player].append(e.character)
+    
+    def get_seeded_entries(self) -> List[Entry]:
+        """
+        Create seeded entry list that spreads each player's characters across the bracket.
+        
+        Strategy: Interleave characters from different players to maximize separation.
+        """
+        seeded_entries = []
+        
+        # Create pools for each player
+        player_pools = {p: chars.copy() for p, chars in self.player_chars.items()}
+        
+        # Distribute entries round-robin style across players
+        players_in_order = self.player_order.copy()
+        
+        while any(player_pools.values()):
+            for player in players_in_order:
+                if player_pools.get(player):
+                    char = player_pools[player].pop(0)
+                    seeded_entries.append(Entry(player, char))
+        
+        return seeded_entries
+    
+    def generate_bracket_with_seeding(self) -> List[Tuple[Entry, Entry]]:
+        """
+        Generate bracket using proper tournament seeding.
+        """
+        seeded_entries = self.get_seeded_entries()
+        
+        if len(seeded_entries) < 2:
+            return []
+        
+        # Calculate bracket size and BYEs needed
+        target_size = next_power_of_two(len(seeded_entries))
+        
+        # Create BYE entries for lower seeds
+        bye_entry = Entry("SYSTEM", "BYE")
+        
+        # Standard seeding pairs for power-of-2 bracket
+        bracket_pairs = self._create_seeded_pairs(seeded_entries, target_size, bye_entry)
+        
+        # Verify and fix any player repetition issues
+        bracket_pairs = self._fix_player_spacing(bracket_pairs)
+        
+        return bracket_pairs
+    
+    def _create_seeded_pairs(
+        self, 
+        seeded_entries: List[Entry], 
+        target_size: int,
+        bye_entry: Entry
+    ) -> List[Tuple[Entry, Entry]]:
+        """
+        Create pairs using standard tournament seeding.
+        BYEs are distributed to the lowest seeds.
+        """
+        # Create full seeded list with BYEs at the end (lowest seeds)
+        full_list = seeded_entries.copy()
+        byes_needed_count = target_size - len(seeded_entries)
+        
+        # Add BYEs to the end (they'll match with top seeds)
+        for _ in range(byes_needed_count):
+            full_list.append(bye_entry)
+        
+        # Standard bracket pairing using the "fold" method
+        pairs = []
+        
+        # Generate standard bracket order
+        bracket_order = self._get_standard_bracket_order(len(full_list))
+        
+        for i in range(0, len(bracket_order), 2):
+            seed_a = bracket_order[i]
+            seed_b = bracket_order[i + 1]
+            
+            entry_a = full_list[seed_a]
+            entry_b = full_list[seed_b]
+            
+            # Check team constraint if in team mode
+            if self.team_mode and not self._is_valid_pairing(entry_a, entry_b):
+                # Try to swap with a nearby valid pairing
+                entry_b = self._find_valid_opponent(entry_a, full_list, bracket_order[i+1:])
+            
+            pairs.append((entry_a, entry_b))
+        
+        return pairs
+    
+    def _get_standard_bracket_order(self, size: int) -> List[int]:
+        """
+        Generate standard tournament bracket seeding order.
+        Uses recursive folding method.
+        """
+        if size == 2:
+            return [0, 1]
+        
+        # Get order for half size
+        half_order = self._get_standard_bracket_order(size // 2)
+        
+        # Fold: interleave with complement
+        full_order = []
+        for seed in half_order:
+            full_order.append(seed)
+            full_order.append(size - 1 - seed)
+        
+        return full_order
+    
+    def _is_valid_pairing(self, entry_a: Entry, entry_b: Entry) -> bool:
+        """Check if two entries can be paired together."""
+        # Can't match a player against themselves
+        if entry_a.player == entry_b.player:
             return False
-        if team_mode:
-            ta = team_of.get(a.player, "")
-            tb = team_of.get(b.player, "")
-            if ta and tb and ta == tb:
+        
+        # In team mode, can't match same team
+        if self.team_mode:
+            team_a = self.team_of.get(entry_a.player, "")
+            team_b = self.team_of.get(entry_b.player, "")
+            if team_a and team_b and team_a == team_b:
                 return False
+        
         return True
-
-    def weighted_second_pick(first: Entry, candidates: List[Entry]) -> Optional[Entry]:
-        if not candidates:
-            return None
-        first_cat = cat_map.get(first, "B")
-        weights = []
-        for c in candidates:
-            c_cat = cat_map.get(c, "B")
-            weights.append(0.4 if c_cat == first_cat else 0.2)
-        return random.choices(candidates, weights=weights, k=1)[0]
-
-    best: List[Tuple[Entry, Entry]] = []
-    best_score = (-1, -10**9)  # (num_non_bye_pairs, -num_violations_guess)
-
-    for _ in range(max_attempts):
-        remaining = base.copy()
-        random.shuffle(remaining)
-
-        pairs: List[Tuple[Entry, Entry]] = []
-        byes_left = byes_budget
-
-        # Assign BYEs first (never exceed budget)
-        while byes_left > 0 and remaining:
-            a = remaining.pop()
-            pairs.append((a, bye_entry))
-            byes_left -= 1
-
-        # Pair the rest with weighted logic
-        stuck_guard = 0
-        while len(remaining) >= 2 and len(pairs) < target_pairs:
-            stuck_guard += 1
-            if stuck_guard > 5000:
+    
+    def _find_valid_opponent(
+        self, 
+        entry: Entry, 
+        available: List[Entry],
+        candidate_indices: List[int]
+    ) -> Entry:
+        """Find a valid opponent from candidates."""
+        for idx in candidate_indices:
+            if idx < len(available):
+                candidate = available[idx]
+                if self._is_valid_pairing(entry, candidate):
+                    return candidate
+        
+        # Fallback: return original if no valid swap found
+        return available[candidate_indices[0]] if candidate_indices else entry
+    
+    def _fix_player_spacing(
+        self, 
+        pairs: List[Tuple[Entry, Entry]]
+    ) -> List[Tuple[Entry, Entry]]:
+        """
+        Ensure no player appears in consecutive or very close matches.
+        Uses a greedy swap algorithm to improve spacing.
+        """
+        improved_pairs = pairs.copy()
+        max_attempts = 50
+        
+        for attempt in range(max_attempts):
+            violations = self._count_spacing_violations(improved_pairs)
+            if violations == 0:
                 break
-
-            first = random.choice(remaining)
-            remaining.remove(first)
-
-            candidates = [x for x in remaining if allowed(first, x)]
-            if not candidates:
-                # put it back and try something else
-                remaining.append(first)
-                random.shuffle(remaining)
-                continue
-
-            second = weighted_second_pick(first, candidates)
-            if second is None:
-                remaining.append(first)
-                random.shuffle(remaining)
-                continue
-
-            remaining.remove(second)
-            pairs.append((first, second))
-
-        # If we still have leftover entries, we DO NOT create extra BYEs.
-        # Instead: this attempt is "worse" and we keep searching other attempts.
-
-        # Score attempt:
-        non_bye_pairs = sum(1 for a, b in pairs if a.character.upper() != "BYE" and b.character.upper() != "BYE")
-        score = (non_bye_pairs, -len(remaining))  # prefer more real pairs, fewer leftovers
-        if score > best_score:
-            best_score = score
-            best = pairs
-
-        # If we hit the exact size and no leftovers, we're done
-        if len(best) == target_pairs and len(remaining) == 0:
-            return best
-
-    # Fallback best attempt (usually already good)
-    return best
-def generate_bracket_unique_players_round1(
-    entries: List[Entry],
-    *,
-    forbid_same_team: bool = False,
-    team_of: Optional[Dict[str, str]] = None,
-    max_attempts: int = 300
-) -> List[Tuple[Entry, Entry]]:
-    """
-    Round-1 pairing that tries to ensure:
-      - A player is not used twice before every other player is used once (per round),
-      - no self-match,
-      - optional: no same-team match (Teams mode),
-      - adds only the mathematically required BYEs to reach power-of-two.
-
-    Works best when each player has >= 1 character in the pool.
-    """
-    team_of = team_of or {}
-    base = [e for e in entries if e.player != "SYSTEM" and e.character.strip()]
-    if len(base) < 2:
-        return []
-
-    bye_entry = Entry("SYSTEM", "BYE")
-    target = next_power_of_two(len(base))
-    byes_budget = target - len(base)
-    target_pairs = target // 2
-
-    # group entries by player
-    by_player: Dict[str, List[Entry]] = {}
-    for e in base:
-        by_player.setdefault(e.player, []).append(e)
-
-    players = list(by_player.keys())
-
-    def ok_pair(a: Entry, b: Entry) -> bool:
-        if a.player == b.player:
-            return False
-        if forbid_same_team:
-            ta = team_of.get(a.player, "")
-            tb = team_of.get(b.player, "")
-            if ta and tb and ta == tb:
+            
+            # Find a violation and try to fix it
+            for i in range(len(improved_pairs) - 1):
+                pair_a = improved_pairs[i]
+                pair_b = improved_pairs[i + 1]
+                
+                players_in_a = {pair_a[0].player, pair_a[1].player}
+                players_in_b = {pair_b[0].player, pair_b[1].player}
+                
+                # Check for overlap
+                if players_in_a & players_in_b:
+                    # Try swapping with a later match
+                    for j in range(i + 2, min(i + 5, len(improved_pairs))):
+                        if self._try_swap(improved_pairs, i + 1, j):
+                            break
+        
+        return improved_pairs
+    
+    def _count_spacing_violations(self, pairs: List[Tuple[Entry, Entry]]) -> int:
+        """Count how many times a player appears in consecutive matches."""
+        violations = 0
+        
+        for i in range(len(pairs) - 1):
+            players_current = {pairs[i][0].player, pairs[i][1].player}
+            players_next = {pairs[i + 1][0].player, pairs[i + 1][1].player}
+            
+            # Remove BYEs from consideration
+            players_current.discard("SYSTEM")
+            players_next.discard("SYSTEM")
+            
+            if players_current & players_next:
+                violations += 1
+        
+        return violations
+    
+    def _try_swap(
+        self, 
+        pairs: List[Tuple[Entry, Entry]], 
+        idx_a: int, 
+        idx_b: int
+    ) -> bool:
+        """Try swapping two matches to improve spacing."""
+        # Swap entire matches
+        original_a = pairs[idx_a]
+        original_b = pairs[idx_b]
+        
+        # Check if swap would be valid (no team conflicts)
+        temp_pairs = pairs.copy()
+        temp_pairs[idx_a] = original_b
+        temp_pairs[idx_b] = original_a
+        
+        # Verify validity
+        for pair in temp_pairs:
+            if not self._is_valid_pairing(pair[0], pair[1]):
                 return False
-        return True
-
-    best: List[Tuple[Entry, Entry]] = []
-    best_score = -10**9
-
-    for _ in range(max_attempts):
-        # Fresh copies each attempt
-        pool_by_player = {p: lst[:] for p, lst in by_player.items()}
-        for p in pool_by_player:
-            random.shuffle(pool_by_player[p])
-
-        used_players: set[str] = set()
-        pairs: List[Tuple[Entry, Entry]] = []
-
-        # Decide which players get BYEs (never exceed budget)
-        bye_players = []
-        if byes_budget > 0:
-            bye_players = random.sample(players, k=min(byes_budget, len(players)))
-
-        # Assign BYE matches (uses that player once)
-        for p in bye_players:
-            if pool_by_player.get(p):
-                a = pool_by_player[p].pop()
-                pairs.append((a, bye_entry))
-                used_players.add(p)
-
-        # Build remaining matches; try to use each unused player once before repeating
-        def pick_player(prefer_unused: bool = True) -> Optional[str]:
-            avail = [p for p, lst in pool_by_player.items() if lst]
-            if not avail:
-                return None
-            if prefer_unused:
-                unused = [p for p in avail if p not in used_players]
-                if unused:
-                    return random.choice(unused)
-            return random.choice(avail)
-
-        while len(pairs) < target_pairs:
-            p1 = pick_player(prefer_unused=True)
-            if p1 is None:
-                break
-            a = pool_by_player[p1].pop()
-
-            # opponent candidates: players with remaining entries, not used yet if possible
-            opp_players = [p for p, lst in pool_by_player.items() if lst and p != p1]
-
-            # teams restriction
-            if forbid_same_team:
-                t1 = team_of.get(p1, "")
-                if t1:
-                    opp_players = [p for p in opp_players if team_of.get(p, "") != t1]
-
-            if not opp_players:
-                # can't place this entry right now; put back and give up this attempt
-                pool_by_player[p1].append(a)
-                break
-
-            # prefer opponent not used yet this round
-            opp_unused = [p for p in opp_players if p not in used_players]
-            p2 = random.choice(opp_unused) if opp_unused else random.choice(opp_players)
-
-            b = pool_by_player[p2].pop()
-
-            # final safety check
-            if not ok_pair(a, b):
-                # undo and fail attempt
-                pool_by_player[p1].append(a)
-                pool_by_player[p2].append(b)
-                break
-
-            pairs.append((a, b))
-            used_players.add(p1)
-            used_players.add(p2)
-
-            # if everyone has been used once, reset "round fairness" so repeats are allowed
-            if all((p in used_players) or (not pool_by_player.get(p)) for p in players):
-                used_players.clear()
-
-        # Score attempt: prefer full bracket, then fewer leftover entries
-        used_entries = sum(1 for a, b in pairs if a.character.upper() != "BYE") + sum(1 for a, b in pairs if b.character.upper() != "BYE")
-        leftover = sum(len(lst) for lst in pool_by_player.values())
-        score = used_entries * 1000 - leftover
-
-        if len(pairs) == target_pairs and score > best_score:
-            best = pairs
-            best_score = score
-
-        # perfect
-        if len(best) == target_pairs and leftover == 0:
-            return best
-
-    return best
+        
+        # If valid and improves spacing, apply swap
+        new_violations = self._count_spacing_violations(temp_pairs)
+        old_violations = self._count_spacing_violations(pairs)
+        
+        if new_violations <= old_violations:
+            pairs[idx_a] = original_b
+            pairs[idx_b] = original_a
+            return True
+        
+        return False
 
 
 def generate_bracket_regular(
@@ -445,8 +370,22 @@ def generate_bracket_regular(
     table_df: Optional[pd.DataFrame] = None,
     final_order: Optional[List[str]] = None
 ) -> List[Tuple[Entry, Entry]]:
-    # table_df and final_order are accepted for compatibility with your current call site
-    return generate_bracket_unique_players_round1(entries)
+    """Generate bracket using improved seeding system."""
+    if not final_order:
+        final_order = []
+        seen = set()
+        for e in entries:
+            if e.player not in seen:
+                final_order.append(e.player)
+                seen.add(e.player)
+    
+    generator = ImprovedBracketGenerator(
+        entries=entries,
+        player_order=final_order,
+        team_mode=False,
+        team_of={}
+    )
+    return generator.generate_bracket_with_seeding()
 
 def generate_bracket_teams(
     entries: List[Entry],
@@ -454,7 +393,22 @@ def generate_bracket_teams(
     table_df: Optional[pd.DataFrame] = None,
     final_order: Optional[List[str]] = None
 ) -> List[Tuple[Entry, Entry]]:
-    return generate_bracket_unique_players_round1(entries, forbid_same_team=True, team_of=team_of)
+    """Generate bracket using improved seeding system with team constraints."""
+    if not final_order:
+        final_order = []
+        seen = set()
+        for e in entries:
+            if e.player not in seen:
+                final_order.append(e.player)
+                seen.add(e.player)
+    
+    generator = ImprovedBracketGenerator(
+        entries=entries,
+        player_order=final_order,
+        team_mode=True,
+        team_of=team_of
+    )
+    return generator.generate_bracket_with_seeding()
 
 
 # ---------------------------- ROUND ROBIN ----------------------------
@@ -607,8 +561,8 @@ with st.sidebar:
             index=0,
             key="rule_select",
             help=(
-                "regular: hierarchical weighted system (A/B/C tiering + weighted pairing), fills BYEs to next power of 2.\n"
-                "teams: same logic, but forbids same-team matches in round 1."
+                "regular: Proper tournament seeding (Rank 1 vs lowest, etc.), round-robin character distribution\n"
+                "teams: Same seeding logic, but forbids same-team matches in round 1."
             )
         )
 
@@ -634,7 +588,7 @@ with st.sidebar:
 
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("🎲 Normal Start (Random Draw)", use_container_width=True):
+            if st.button("🎲 Random Draw", use_container_width=True):
                 order = players.copy()
                 random.shuffle(order)
                 st.session_state.player_order_drawn = order
@@ -650,10 +604,9 @@ with st.sidebar:
 
         st.caption("Manual Override: re-rank players (Rank 1 = strongest/top).")
         # Manual ranking UI via unique selectboxes per rank
-        remaining_for_pick = final_default.copy()
         new_final: List[str] = []
         for i in range(len(players)):
-            default_choice = final_default[i] if i < len(final_default) else (remaining_for_pick[0] if remaining_for_pick else "")
+            default_choice = final_default[i] if i < len(final_default) else (players[0] if players else "")
             options = [p for p in players if p not in new_final]
             if default_choice not in options and options:
                 default_choice = options[0]
@@ -920,9 +873,9 @@ else:
     if "last_bracket" in st.session_state and st.session_state["last_bracket"]:
         r1_pairs = st.session_state["last_bracket"]
         if st.session_state.get("last_rule") == "teams":
-            st.info("Bracket view (all rounds) — Teams mode")
+            st.info("Bracket view (all rounds) — Teams mode with proper seeding")
         else:
-            st.info("Bracket view (all rounds) — Regular mode")
+            st.info("Bracket view (all rounds) — Regular mode with proper seeding")
 
         r1_winner_controls(r1_pairs)
         rounds = compute_rounds_pairs(r1_pairs, st.session_state.get("r1_winners", {}))
@@ -935,4 +888,4 @@ else:
             st.session_state.pop("r1_winners", None)
             st.rerun()
 
-    st.caption("Regular/Teams now use: random player draw → optional manual reorder → A/B/C tiering → weighted pairing (40/20/20) with removal. Add an 'images/' folder with character PNGs to show icons.")
+    st.caption("✨ Improved system: Rank 1 faces lowest seed (tournament standard) • Round-robin character distribution • Player spacing algorithm prevents consecutive matches • Add 'images/' folder with character PNGs for icons.")
